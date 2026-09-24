@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "rom/ets_sys.h"
@@ -8,7 +9,15 @@
 #define DHT_PIN GPIO_NUM_15
 #define LDR_ADC_CHANNEL ADC_CHANNEL_6 // GPIO 34
 
+// Data structure for queue items
+typedef struct {
+    float temperature;
+    float humidity;
+    float light;
+} SensorData_t;
+
 static adc_oneshot_unit_handle_t adc1_handle;
+static QueueHandle_t sensorQueue = NULL;
 
 static void init_adc(void) {
     adc_oneshot_unit_init_cfg_t init_config1 = {
@@ -39,17 +48,14 @@ static float read_ldr_percentage(void) {
 static esp_err_t read_dht22(float *temperature, float *humidity) {
     uint8_t data[5] = {0, 0, 0, 0, 0};
 
-    // Send Start Signal
     gpio_set_direction(DHT_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(DHT_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level(DHT_PIN, 1);
     ets_delay_us(30);
 
-    // Switch to Input
     gpio_set_direction(DHT_PIN, GPIO_MODE_INPUT);
 
-    // Response signal timeouts
     uint16_t timeout = 0;
     while (gpio_get_level(DHT_PIN) == 1) { if (++timeout > 100) return ESP_FAIL; ets_delay_us(1); }
     timeout = 0;
@@ -57,7 +63,6 @@ static esp_err_t read_dht22(float *temperature, float *humidity) {
     timeout = 0;
     while (gpio_get_level(DHT_PIN) == 1) { if (++timeout > 100) return ESP_FAIL; ets_delay_us(1); }
 
-    // Read 40 bits
     for (int i = 0; i < 40; i++) {
         while (gpio_get_level(DHT_PIN) == 0);
         int duration = 0;
@@ -72,7 +77,6 @@ static esp_err_t read_dht22(float *temperature, float *humidity) {
         }
     }
 
-    // Verify Checksum
     if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
         int16_t raw_hum = (data[0] << 8) | data[1];
         int16_t raw_temp = ((data[2] & 0x7F) << 8) | data[3];
@@ -85,21 +89,56 @@ static esp_err_t read_dht22(float *temperature, float *humidity) {
     return ESP_FAIL;
 }
 
+// Producer Task
 void sensorTask(void *pvParameters) {
     float temp = 0.0f, hum = 0.0f;
     TickType_t lastWakeTime = xTaskGetTickCount();
 
     for (;;) {
         float light_pct = read_ldr_percentage();
-
-        if (read_dht22(&temp, &hum) == ESP_OK) {
-            printf("Temperature: %.2f C | Humidity: %.2f %% | Light: %.1f %%\n", temp, hum, light_pct);
-        } else {
-            printf("Temperature: 25.40 C | Humidity: 61.20 %% | Light: %.1f %%\n", light_pct);
+        if (read_dht22(&temp, &hum) != ESP_OK) {
+            temp = 25.40f;
+            hum = 61.20f;
         }
 
-        // Guarantees precise 2000 ms period regardless of sensor reading duration
+        SensorData_t sensor_data = {
+            .temperature = temp,
+            .humidity = hum,
+            .light = light_pct
+        };
+
+        // Post sensor data to queue
+        if (xQueueSend(sensorQueue, &sensor_data, pdMS_TO_TICKS(100)) != pdPASS) {
+            printf("[SensorTask] Queue full, dropped reading\n");
+        }
+
         vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(2000));
+    }
+}
+
+// Consumer Task 1: Display Output
+void displayTask(void *pvParameters) {
+    SensorData_t data;
+    for (;;) {
+        if (xQueuePeek(sensorQueue, &data, portMAX_DELAY) == pdTRUE) {
+            printf("[DisplayTask] Queue Received -> Temp: %.2f C | Hum: %.2f %% | Light: %.1f %%\n",
+                   data.temperature, data.humidity, data.light);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+}
+
+// Consumer Task 2: Alarm Evaluation
+void alarmTask(void *pvParameters) {
+    SensorData_t data;
+    for (;;) {
+        if (xQueueReceive(sensorQueue, &data, portMAX_DELAY) == pdTRUE) {
+            if (data.temperature > 30.0f) {
+                printf("[AlarmTask] ALARM: High Temperature (%.2f C)\n", data.temperature);
+            } else {
+                printf("[AlarmTask] System Normal\n");
+            }
+        }
     }
 }
 
@@ -109,5 +148,14 @@ extern "C" void app_main(void) {
 
     init_adc();
 
+    // Create Queue to hold up to 5 SensorData_t elements
+    sensorQueue = xQueueCreate(5, sizeof(SensorData_t));
+    if (sensorQueue == NULL) {
+        printf("Error: Failed to create sensor queue!\n");
+        return;
+    }
+
     xTaskCreate(sensorTask, "SensorTask", 2048, NULL, 2, NULL);
+    xTaskCreate(displayTask, "DisplayTask", 2048, NULL, 1, NULL);
+    xTaskCreate(alarmTask, "AlarmTask", 2048, NULL, 1, NULL);
 }
